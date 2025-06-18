@@ -1,8 +1,10 @@
-# Large data files
+# Data files
 *.csv
 AML1.csv
+data/*.csv
+training_data.csv
 
-# Virtual environment
+# Virtual environments
 final/
 venv/
 env/
@@ -12,10 +14,12 @@ env/
 __pycache__/
 *.pyc
 *.pyo
-
-# Model files (if too large)
-models/*.pkl
+src/__pycache__/
 
 # IDE files
 .vscode/
 .idea/
+
+# OS files
+.DS_Store
+Thumbs.db
