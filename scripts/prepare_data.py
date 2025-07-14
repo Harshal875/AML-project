@@ -15,8 +15,7 @@ def prepare_training_data():
     
     # Load your full dataset
     df = pd.read_csv("AML1.csv")  # Your actual dataset file
-    
-    print(f"Original dataset: {len(df)} transactions")
+
     print(f"Columns found: {list(df.columns)}")
     
     # Check current distribution
@@ -25,7 +24,7 @@ def prepare_training_data():
     normal_txns = df[~suspicious_mask]
     
     print(f"Suspicious transactions: {len(suspicious_txns)}")
-    print(f"Normal transactions: {len(normal_txns)}")
+ 
     
     # Keep ALL suspicious transactions (956)
     print("✅ Keeping all suspicious transactions")

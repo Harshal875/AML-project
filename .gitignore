@@ -1,25 +1,26 @@
-# Data files
+# Environment Variables (API Keys)
+.env
+
+# Large Dataset Files
 *.csv
 AML1.csv
-data/*.csv
-training_data.csv
+SAML-D.csv
 
-# Virtual environments
-final/
-venv/
-env/
-*.env
-
-# Python cache
+# Python Cache
 __pycache__/
 *.pyc
-*.pyo
-src/__pycache__/
 
-# IDE files
-.vscode/
-.idea/
+# ML Models (Large Files)
+models/*.pkl
 
-# OS files
+# Vector Database (Can Regenerate)
+data/chroma_db/
+
+# Virtual Environment
+venv/
+.venv
+final/    # ADD THIS LINE
+
+# OS Files
 .DS_Store
 Thumbs.db

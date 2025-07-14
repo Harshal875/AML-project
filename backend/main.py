@@ -12,6 +12,9 @@ import io
 import os
 from typing import List
 
+# ADD: Import compliance router
+from compliance.routes import compliance_router
+
 # Add src directory to Python path
 import sys
 import os
@@ -31,6 +34,9 @@ except Exception as e:
 
 # FastAPI app
 app = FastAPI(title="AML Transaction Screening", version="1.0.0")
+
+# ADD: Include compliance router
+app.include_router(compliance_router)
 
 # CORS middleware
 app.add_middleware(
@@ -244,7 +250,7 @@ async def upload_csv(file: UploadFile = File(...)):
         print(f"📊 CSV loaded: {len(df)} rows, columns: {list(df.columns)}")
         
         # Validate data first
-        validation_result = validate_csv_data(df)
+        validation_result = validate_csv_data(df)                                   #this function defined above
         if not validation_result.is_valid:
             error_details = []
             for error in validation_result.errors[:5]:  # Show first 5 errors

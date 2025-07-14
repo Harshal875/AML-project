@@ -34,11 +34,13 @@ def train_aml_model():
     
     # Feature engineering
     print("🔧 Creating features...")
-    engineer = AMLFeatureEngineer()
-    df_features = engineer.create_features(df)
+    engineer = AMLFeatureEngineer()                                        #object for feature engineering class
+    df_features = engineer.create_features(df)                             #object calls the create_features method 
+                                                                           # which returns a DataFrame with engineered features
+                                                                           #create_features calls the create_velocity_features method
     
     # Prepare features and target
-    feature_cols = engineer.get_feature_columns()
+    feature_cols = engineer.get_feature_columns()                          #get_feature_columns returns a list of feature names
     X = df_features[feature_cols].fillna(0)
     y = df_features['Is_laundering']
     
@@ -61,14 +63,14 @@ def train_aml_model():
     
     # Apply SMOTE for class balancing - OPTIMIZED FOR RECALL
     print("⚖️ Applying SMOTE for maximum recall...")
-    minority_size = y_train.sum()
+    minority_size = y_train.sum()                                 # Count of suspicious transactions in training set because 1=suspicious, 0=normal
     k_neighbors = min(5, minority_size - 1)
     
     # Use regular SMOTE with full balancing for better recall
     smote = SMOTE(
         random_state=42, 
         k_neighbors=k_neighbors,
-        sampling_strategy=1.0  # Full balance - equal numbers of each class
+        sampling_strategy=1.0                                       # Full balance - equal numbers of each class
     )
     X_train_balanced, y_train_balanced = smote.fit_resample(X_train_scaled, y_train)
     

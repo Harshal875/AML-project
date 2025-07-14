@@ -22,22 +22,23 @@ class AMLFeatureEngineer:
         
         # Create datetime column
         df['datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d-%m-%Y %H:%M:%S')
-        df = df.sort_values('datetime').reset_index(drop=True)
+        df = df.sort_values('datetime').reset_index(drop=True)    #sort by datetime
         
         # 1-6: Basic Time Features
         df['hour'] = df['datetime'].dt.hour
         df['day_of_week'] = df['datetime'].dt.dayofweek
         df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
         df['is_night'] = ((df['hour'] >= 22) | (df['hour'] <= 6)).astype(int)
-        df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17)).astype(int)
+        df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17)).astype(int)           #9-5 is business hours
         df['month'] = df['datetime'].dt.month
         
         # 7-12: Amount Features
         df['amount_log'] = np.log1p(df['Amount'])
         df['is_round_amount'] = (df['Amount'] % 1000 == 0).astype(int)
         df['is_just_under_10k'] = ((df['Amount'] >= 9000) & (df['Amount'] < 10000)).astype(int)
-        df['is_large_amount'] = (df['Amount'] > df['Amount'].quantile(0.95)).astype(int)
-        df['is_small_amount'] = (df['Amount'] < df['Amount'].quantile(0.05)).astype(int)
+        df['is_large_amount'] = (df['Amount'] > df['Amount'].quantile(0.95)).astype(int)       # Top 5% large amounts
+        df['is_small_amount'] = (df['Amount'] < df['Amount'].quantile(0.05)).astype(int)       # Bottom 5% small amounts
+        # Create amount categories (0-4)
         df['amount_category'] = pd.cut(df['Amount'], bins=5, labels=[0,1,2,3,4]).astype(int)
         
         # 13-16: Geographic Features
