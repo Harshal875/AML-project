@@ -1,362 +1,381 @@
 """
-Simple FastAPI Backend for AML Transaction Screening
-Single file with all endpoints
+Simplified AML Transaction Screening API
+Clean, focused backend with ML + RAG capabilities
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import os
+import sys
+import logging
+import asyncio
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+# Core FastAPI imports
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+# Data processing
 import pandas as pd
 import numpy as np
 import joblib
-import io
-import os
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# ADD: Import compliance router
-from compliance.routes import compliance_router
+load_dotenv()
 
-# Add src directory to Python path
-import sys
-import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
-
-# Load trained model and components
+# Import compliance router
 try:
-    model = joblib.load('models/xgboost_aml_model.pkl')
-    scaler = joblib.load('models/scaler.pkl')
-    feature_engineer = joblib.load('models/feature_engineer.pkl')
-    feature_columns = joblib.load('models/feature_columns.pkl')
-    MODEL_LOADED = True
-    print("✅ Model loaded successfully")
-except Exception as e:
-    print(f"⚠️ Model not found: {e}")
-    MODEL_LOADED = False
+    from compliance.routes import compliance_router
+    COMPLIANCE_AVAILABLE = True
+    print("✅ Compliance module loaded successfully")
+except ImportError as e:
+    print(f"❌ Failed to load compliance module: {e}")
+    COMPLIANCE_AVAILABLE = False
 
-# FastAPI app
-app = FastAPI(title="AML Transaction Screening", version="1.0.0")
+# Configure logging
+def setup_logging():
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger(__name__)
 
-# ADD: Include compliance router
-app.include_router(compliance_router)
+logger = setup_logging()
+
+# Global application state
+class AppState:
+    def __init__(self):
+        self.ml_components = None
+        self.preprocessor = None
+        self.stats = {
+            "total_transactions": 0,
+            "suspicious_transactions": 0,
+            "uptime_start": pd.Timestamp.now(),
+            "requests_processed": 0
+        }
+        self.health_status = "starting"
+
+app_state = AppState()
+
+# AML Preprocessor Class
+class AMLPreprocessor:
+    """Clean AML feature preprocessor - same 33 features as training"""
+    
+    def __init__(self, encoders, scaler):
+        self.encoders = encoders
+        self.scaler = scaler
+        self.high_risk_countries = [
+            'Albania', 'Nigeria', 'Pakistan', 'Morocco', 'Turkey',
+            'Afghanistan', 'Barbados', 'Botswana', 'Burkina Faso',
+            'Cambodia', 'Cayman Islands', 'Haiti', 'Iran', 'Jamaica', 
+            'Jordan', 'Mali', 'Myanmar', 'Nicaragua', 'Panama', 
+            'Philippines', 'Senegal', 'South Sudan', 'Syria', 
+            'Uganda', 'Yemen', 'Zimbabwe'
+        ]
+        logger.info("✅ AML preprocessor initialized")
+    
+    def create_features(self, df):
+        """Create the same 33 features used in training"""
+        try:
+            df = df.copy()
+            
+            # 1. DATETIME FEATURES
+            df['Date'] = pd.to_datetime(df['Date'])
+            df['Time'] = pd.to_datetime(df['Time'], format='%H:%M:%S', errors='coerce')
+            
+            df['hour'] = df['Time'].dt.hour
+            df['day_of_week'] = df['Date'].dt.dayofweek
+            df['month'] = df['Date'].dt.month
+            df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+            df['is_business_hours'] = ((df['hour'] >= 9) & (df['hour'] <= 17)).astype(int)
+            df['is_night_transaction'] = ((df['hour'] >= 22) | (df['hour'] <= 6)).astype(int)
+            
+            # 2. AMOUNT FEATURES
+            df['amount_log'] = np.log1p(df['Amount'])
+            df['is_large_amount'] = (df['Amount'] > 10000).astype(int)
+            df['is_just_under_threshold'] = ((df['Amount'] >= 9000) & (df['Amount'] < 10000)).astype(int)
+            df['is_round_amount'] = (df['Amount'] % 1000 == 0).astype(int)
+            df['is_small_amount'] = (df['Amount'] < 100).astype(int)
+            df['amount_percentile'] = df['Amount'].rank(pct=True)
+            
+            # 3. GEOGRAPHIC FEATURES
+            df['is_cross_border'] = (df['Sender_bank_location'] != df['Receiver_bank_location']).astype(int)
+            df['sender_high_risk'] = df['Sender_bank_location'].isin(self.high_risk_countries).astype(int)
+            df['receiver_high_risk'] = df['Receiver_bank_location'].isin(self.high_risk_countries).astype(int)
+            df['involves_high_risk_country'] = ((df['sender_high_risk'] == 1) | (df['receiver_high_risk'] == 1)).astype(int)
+            
+            # 4. CURRENCY FEATURES
+            df['is_currency_exchange'] = (df['Payment_currency'] != df['Received_currency']).astype(int)
+            
+            # 5. PAYMENT TYPE FEATURES
+            df['is_cash_transaction'] = df['Payment_type'].isin(['Cash Deposit', 'Cash Withdrawal']).astype(int)
+            df['is_cash_deposit'] = (df['Payment_type'] == 'Cash Deposit').astype(int)
+            df['is_cash_withdrawal'] = (df['Payment_type'] == 'Cash Withdrawal').astype(int)
+            df['is_cross_border_payment'] = (df['Payment_type'] == 'Cross-border').astype(int)
+            df['is_card_payment'] = df['Payment_type'].isin(['Credit card', 'Debit card']).astype(int)
+            df['is_wire_transfer'] = df['Payment_type'].isin(['ACH', 'Cross-border']).astype(int)
+            
+            # 6. VELOCITY FEATURES
+            df['account_date_key'] = df['Sender_account'].astype(str) + '_' + df['Date'].astype(str)
+            
+            account_date_counts = df['account_date_key'].value_counts().to_dict()
+            df['daily_txn_count'] = df['account_date_key'].map(account_date_counts)
+            
+            account_date_amounts = df.groupby('account_date_key')['Amount'].sum().to_dict()
+            df['daily_amount_sum'] = df['account_date_key'].map(account_date_amounts)
+            
+            account_date_receivers = df.groupby('account_date_key')['Receiver_account'].nunique().to_dict()
+            df['unique_receivers_today'] = df['account_date_key'].map(account_date_receivers)
+            
+            account_avg_daily = df.groupby('Sender_account')['daily_txn_count'].transform('mean')
+            df['transaction_frequency_score'] = np.where(
+                account_avg_daily > 0,
+                df['daily_txn_count'] / account_avg_daily,
+                1.0
+            )
+            
+            # Clean up
+            df = df.drop(['account_date_key'], axis=1)
+            
+            # 7. ENCODE CATEGORICAL VARIABLES
+            categorical_cols = ['Payment_type', 'Sender_bank_location', 'Receiver_bank_location', 
+                               'Payment_currency', 'Received_currency']
+            
+            for col in categorical_cols:
+                if col in self.encoders:
+                    known_values = set(self.encoders[col].classes_)
+                    df[f'{col}_encoded'] = df[col].astype(str).apply(
+                        lambda x: self.encoders[col].transform([x])[0] if x in known_values else -1
+                    )
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"❌ Feature creation failed: {str(e)}")
+            raise
+
+def load_ml_components():
+    """Load ML components with error handling"""
+    try:
+        model_path = Path("models")
+        if not model_path.exists():
+            raise FileNotFoundError("Models directory not found")
+        
+        required_files = [
+            'trained_aml_model.pkl', 'optimal_threshold.pkl', 'scaler.pkl',
+            'encoders.pkl', 'feature_columns.pkl'
+        ]
+        
+        missing_files = [f for f in required_files if not (model_path / f).exists()]
+        if missing_files:
+            raise FileNotFoundError(f"Missing model files: {missing_files}")
+        
+        logger.info("📦 Loading ML components...")
+        
+        components = {
+            'model': joblib.load('models/trained_aml_model.pkl'),
+            'threshold': joblib.load('models/optimal_threshold.pkl'),
+            'scaler': joblib.load('models/scaler.pkl'),
+            'encoders': joblib.load('models/encoders.pkl'),
+            'feature_columns': joblib.load('models/feature_columns.pkl'),
+            'loaded': True
+        }
+        
+        logger.info(f"✅ ML components loaded - Threshold: {components['threshold']}")
+        return components
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load ML components: {str(e)}")
+        return {'loaded': False, 'error': str(e)}
+
+async def startup_tasks():
+    """Startup tasks for the application"""
+    try:
+        logger.info("🚀 Starting AML Transaction Screening API...")
+        
+        # Create necessary directories
+        for directory in ["data/regulatory_docs", "data/local_vectors", "logs"]:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        
+        # Load ML components
+        app_state.ml_components = load_ml_components()
+        
+        if app_state.ml_components['loaded']:
+            app_state.preprocessor = AMLPreprocessor(
+                app_state.ml_components['encoders'],
+                app_state.ml_components['scaler']
+            )
+        
+        app_state.health_status = "healthy"
+        logger.info("🎉 Application startup complete")
+        
+    except Exception as e:
+        logger.error(f"❌ Startup failed: {str(e)}")
+        app_state.health_status = "unhealthy"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup_tasks()
+    yield
+    logger.info("🛑 Application shutting down")
+
+# Create FastAPI application
+app = FastAPI(
+    title="AML Transaction Screening API",
+    description="AML compliance and transaction screening with ML + RAG",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Include compliance router
+if COMPLIANCE_AVAILABLE:
+    app.include_router(compliance_router)
+    logger.info("✅ Compliance router included")
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models for validation
-class TransactionInput(BaseModel):
-    """Validate individual transaction from CSV"""
-    Time: str
-    Date: str  
-    Sender_account: str
-    Receiver_account: str
-    Amount: float
-    Payment_currency: str
-    Received_currency: str
-    Sender_bank_location: str
-    Receiver_bank_location: str
-    Payment_type: str
+# Request counter middleware
+@app.middleware("http")
+async def count_requests(request, call_next):
+    app_state.stats["requests_processed"] += 1
+    response = await call_next(request)
+    return response
 
-class TransactionResult(BaseModel):
-    sender_account: str
-    receiver_account: str
-    amount: float
-    risk_score: float
-    is_suspicious: bool
-    risk_level: str
+# Exception handlers
+@app.exception_handler(StarletteHTTPException)
+async def custom_http_exception_handler(request, exc):
+    logger.error(f"HTTP {exc.status_code}: {exc.detail}")
+    return await http_exception_handler(request, exc)
 
-class BatchResult(BaseModel):
-    total_transactions: int
-    suspicious_count: int
-    high_risk_count: int
-    medium_risk_count: int
-    low_risk_count: int
-    predictions: List[TransactionResult]
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    logger.error(f"Validation error: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"status": "error", "error": "validation_failed", "details": str(exc)}
+    )
 
-class Stats(BaseModel):
-    total_transactions: int
-    suspicious_transactions: int
-    detection_rate: float
-    risk_distribution: dict
+# Pydantic models
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    uptime: str
+    version: str
+    components: dict
+    stats: dict
 
-class ValidationError(BaseModel):
-    row: int
-    column: str
-    error: str
-    value: str
-
-class ValidationResult(BaseModel):
-    is_valid: bool
-    total_rows: int
-    valid_rows: int
-    errors: List[ValidationError]
-
-# Global stats storage (in production, use a database)
-PROCESSED_STATS = {
-    "total_transactions": 0,
-    "suspicious_transactions": 0,
-    "risk_distribution": {"high_risk": 0, "medium_risk": 0, "low_risk": 0}
-}
-
+# Root endpoint
 @app.get("/")
-def root():
-    """Root endpoint"""
+async def root():
+    """Root endpoint with system information"""
     return {
-        "message": "🏦 AML Transaction Screening API",
-        "model_loaded": MODEL_LOADED,
-        "endpoints": {
-            "upload": "/upload-csv",
+        "message": "🏦 AML Transaction Screening API v2.0",
+        "status": app_state.health_status,
+        "ml_model": "loaded" if app_state.ml_components and app_state.ml_components['loaded'] else "not_loaded",
+        "compliance_module": "available" if COMPLIANCE_AVAILABLE else "unavailable",
+        "capabilities": [
+            "ML-based transaction risk assessment (XGBoost + 33 features)",
+            "RAG-enabled compliance analysis" if COMPLIANCE_AVAILABLE else "Basic analysis only",
+            "Batch CSV processing with full compliance check",
+            "Local vector embeddings for regulation search"
+        ],
+        "main_endpoint": "/compliance/enhanced-csv-upload",
+        "other_endpoints": {
+            "health": "/health",
             "stats": "/stats",
-            "health": "/health"
+            "compliance": "/compliance/*" if COMPLIANCE_AVAILABLE else "not_available"
         }
     }
 
-@app.get("/health")
-def health_check():
-    """Health check"""
-    return {
-        "status": "healthy",
-        "model_loaded": MODEL_LOADED
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """System health check"""
+    uptime = pd.Timestamp.now() - app_state.stats["uptime_start"]
+    
+    components = {
+        "ml_model": "healthy" if app_state.ml_components and app_state.ml_components['loaded'] else "unhealthy",
+        "preprocessor": "healthy" if app_state.preprocessor else "unhealthy",
+        "compliance_module": "healthy" if COMPLIANCE_AVAILABLE else "unavailable"
     }
-
-def validate_csv_data(df):
-    """Validate CSV data using Pydantic"""
-    errors = []
-    valid_rows = 0
     
-    required_columns = ['Time', 'Date', 'Sender_account', 'Receiver_account', 'Amount', 
-                       'Payment_currency', 'Received_currency', 'Sender_bank_location', 
-                       'Receiver_bank_location', 'Payment_type']
+    overall_status = "healthy" if all(c in ["healthy", "unavailable"] for c in components.values()) else "degraded"
     
-    # Check for missing columns
-    missing_cols = [col for col in required_columns if col not in df.columns]
-    if missing_cols:
-        return ValidationResult(
-            is_valid=False,
-            total_rows=len(df),
-            valid_rows=0,
-            errors=[ValidationError(row=0, column=', '.join(missing_cols), 
-                                  error="Missing required columns", value="")]
-        )
-    
-    # Validate each row
-    for idx, row in df.iterrows():
-        try:
-            # Try to create TransactionInput object (validates data types)
-            transaction = TransactionInput(
-                Time=str(row['Time']).strip(),
-                Date=str(row['Date']).strip(),
-                Sender_account=str(row['Sender_account']).strip(),
-                Receiver_account=str(row['Receiver_account']).strip(),
-                Amount=float(row['Amount']),
-                Payment_currency=str(row['Payment_currency']).strip(),
-                Received_currency=str(row['Received_currency']).strip(),
-                Sender_bank_location=str(row['Sender_bank_location']).strip(),
-                Receiver_bank_location=str(row['Receiver_bank_location']).strip(),
-                Payment_type=str(row['Payment_type']).strip()
-            )
-            
-            # Additional validation rules
-            if transaction.Amount <= 0:
-                errors.append(ValidationError(
-                    row=idx + 1, column="Amount", 
-                    error="Amount must be positive", value=str(row['Amount'])
-                ))
-                continue
-                
-            # Validate date format (DD-MM-YYYY)
-            try:
-                pd.to_datetime(transaction.Date, format='%d-%m-%Y')
-            except:
-                errors.append(ValidationError(
-                    row=idx + 1, column="Date", 
-                    error="Date must be in DD-MM-YYYY format", value=transaction.Date
-                ))
-                continue
-                
-            # Validate time format (HH:MM:SS)
-            try:
-                pd.to_datetime(transaction.Time, format='%H:%M:%S')
-            except:
-                errors.append(ValidationError(
-                    row=idx + 1, column="Time", 
-                    error="Time must be in HH:MM:SS format", value=transaction.Time
-                ))
-                continue
-            
-            valid_rows += 1
-            
-        except Exception as e:
-            errors.append(ValidationError(
-                row=idx + 1, column="validation", 
-                error=str(e), value=""
-            ))
-    
-    return ValidationResult(
-        is_valid=len(errors) == 0,
-        total_rows=len(df),
-        valid_rows=valid_rows,
-        errors=errors[:10]  # Return only first 10 errors
+    return HealthResponse(
+        status=overall_status,
+        timestamp=pd.Timestamp.now().isoformat(),
+        uptime=str(uptime),
+        version="2.0.0",
+        components=components,
+        stats=app_state.stats
     )
 
-@app.post("/validate-csv", response_model=ValidationResult)
-async def validate_csv(file: UploadFile = File(...)):
-    """Validate CSV file before processing"""
+@app.get("/stats")
+async def get_stats():
+    """Get system statistics"""
+    uptime = pd.Timestamp.now() - app_state.stats["uptime_start"]
     
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files allowed")
-    
-    try:
-        # Read CSV
-        content = await file.read()
-        df = pd.read_csv(io.StringIO(content.decode('utf-8')))
-        
-        # Validate data
-        validation_result = validate_csv_data(df)
-        return validation_result
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {str(e)}")
-
-@app.post("/upload-csv", response_model=BatchResult)
-async def upload_csv(file: UploadFile = File(...)):
-    """Upload CSV and get AML predictions with validation"""
-    
-    if not MODEL_LOADED:
-        raise HTTPException(status_code=503, detail="Model not available. Train the model first.")
-    
-    # Validate file
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files allowed")
-    
-    try:
-        # Read CSV with better parsing
-        content = await file.read()
-        
-        # Try different separators and encodings
-        csv_text = content.decode('utf-8-sig')  # Handle BOM
-        
-        # Try comma first, then semicolon
-        try:
-            df = pd.read_csv(io.StringIO(csv_text), sep=',')
-            if len(df.columns) == 1:  # If only 1 column, try semicolon
-                df = pd.read_csv(io.StringIO(csv_text), sep=';')
-        except:
-            df = pd.read_csv(io.StringIO(csv_text), sep=';')
-        
-        print(f"📊 CSV loaded: {len(df)} rows, columns: {list(df.columns)}")
-        
-        # Validate data first
-        validation_result = validate_csv_data(df)                                   #this function defined above
-        if not validation_result.is_valid:
-            error_details = []
-            for error in validation_result.errors[:5]:  # Show first 5 errors
-                error_details.append(f"Row {error.row}: {error.error} in {error.column}")
-            
-            print(f"❌ CSV validation failed: {'; '.join(error_details)}")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"CSV validation failed. Errors: {'; '.join(error_details)}"
-            )
-        
-        print(f"✅ CSV validation passed. Processing {len(df)} transactions...")
-        
-        # Feature engineering
-        df_features = feature_engineer.create_features(df)
-        
-        # Prepare features for prediction
-        X = df_features[feature_columns].fillna(0)
-        X_scaled = scaler.transform(X)
-        
-        # Make predictions
-        predictions = model.predict(X_scaled)
-        probabilities = model.predict_proba(X_scaled)[:, 1]
-        
-        # Process results
-        results = []
-        risk_counts = {"High": 0, "Medium": 0, "Low": 0}
-        
-        for i, (_, row) in enumerate(df.iterrows()):
-            prob = float(probabilities[i])
-            is_suspicious = bool(predictions[i])
-            
-            # Determine risk level
-            if prob >= 0.7:
-                risk_level = "High"
-            elif prob >= 0.3:
-                risk_level = "Medium"
-            else:
-                risk_level = "Low"
-            
-            risk_counts[risk_level] += 1
-            
-            result = TransactionResult(
-                sender_account=str(row['Sender_account']),
-                receiver_account=str(row['Receiver_account']),
-                amount=float(row['Amount']),
-                risk_score=prob,
-                is_suspicious=is_suspicious,
-                risk_level=risk_level
-            )
-            results.append(result)
-        
-        # Update global stats
-        PROCESSED_STATS["total_transactions"] += len(df)
-        PROCESSED_STATS["suspicious_transactions"] += int(predictions.sum())
-        PROCESSED_STATS["risk_distribution"]["high_risk"] += risk_counts["High"]
-        PROCESSED_STATS["risk_distribution"]["medium_risk"] += risk_counts["Medium"]
-        PROCESSED_STATS["risk_distribution"]["low_risk"] += risk_counts["Low"]
-        
-        print(f"✅ Processed {len(df)} transactions. Found {int(predictions.sum())} suspicious.")
-        
-        # Return batch results
-        return BatchResult(
-            total_transactions=len(df),
-            suspicious_count=int(predictions.sum()),
-            high_risk_count=risk_counts["High"],
-            medium_risk_count=risk_counts["Medium"],
-            low_risk_count=risk_counts["Low"],
-            predictions=results
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-
-@app.get("/stats", response_model=Stats)
-def get_stats():
-    """Get processing statistics"""
-    detection_rate = 0
-    if PROCESSED_STATS["total_transactions"] > 0:
-        detection_rate = (PROCESSED_STATS["suspicious_transactions"] / 
-                         PROCESSED_STATS["total_transactions"]) * 100
-    
-    return Stats(
-        total_transactions=PROCESSED_STATS["total_transactions"],
-        suspicious_transactions=PROCESSED_STATS["suspicious_transactions"],
-        detection_rate=detection_rate,
-        risk_distribution=PROCESSED_STATS["risk_distribution"]
-    )
-
-@app.get("/model-info")
-def get_model_info():
-    """Get model information"""
-    if not MODEL_LOADED:
-        return {"status": "Model not loaded"}
+    model_info = {}
+    if app_state.ml_components and app_state.ml_components['loaded']:
+        model_info = {
+            "loaded": True,
+            "threshold": app_state.ml_components['threshold'],
+            "features": len(app_state.ml_components['feature_columns'])
+        }
+    else:
+        model_info = {"loaded": False}
     
     return {
-        "status": "Active",
-        "model_type": "XGBoost Classifier",
-        "features_count": len(feature_columns),
-        "target_recall": "85%",
-        "training_data": "956 suspicious + 168k normal transactions",
-        "techniques": ["SMOTE", "Velocity Features", "Feature Engineering"]
+        "system": {
+            "status": app_state.health_status,
+            "uptime": str(uptime),
+            "requests_processed": app_state.stats["requests_processed"],
+            "version": "2.0.0"
+        },
+        "transactions": {
+            "total_processed": app_state.stats["total_transactions"],
+            "suspicious_detected": app_state.stats["suspicious_transactions"]
+        },
+        "ml_model": model_info,
+        "compliance": {"available": COMPLIANCE_AVAILABLE}
     }
 
+# Export preprocessor for use in compliance module
+def get_preprocessor():
+    """Get the preprocessor instance for use in other modules"""
+    return app_state.preprocessor
+
+def get_ml_components():
+    """Get ML components for use in other modules"""
+    return app_state.ml_components
+
+# Main entry point
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("API_PORT", 8000))
+    
+    logger.info(f"🚀 Starting server on {host}:{port}")
+    
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        log_level="info",
+        reload=False
+    )
+    

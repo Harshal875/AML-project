@@ -1,199 +1,302 @@
 """
-Simple API routes for compliance features
-These are the endpoints our frontend will call
+Fixed Compliance Routes - All Numpy Serialization Issues Resolved
+Replace your compliance/routes.py with this complete version
 """
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form
-from typing import List
-import os
+from fastapi.responses import JSONResponse
+from typing import List, Optional
+import pandas as pd
+import numpy as np
+import io
+import logging
+from pydantic import BaseModel
+from pathlib import Path
 
-# Import our simple classes
+# Import professional components
+from .compliance_engine import compliance_engine
 from .document_processor import document_processor
 from .vector_store import vector_store
-from models.compliance_models import ComplianceQuery, ComplianceSearchResult
 
-# Create a router for compliance endpoints
+# Configure logging
+logger = logging.getLogger(__name__)
+
+def convert_numpy_types(obj):
+    """Convert numpy types to Python native types for JSON serialization"""
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    return obj
+
+# Pydantic Models
+class ComplianceQuery(BaseModel):
+    question: str
+    max_results: Optional[int] = 5
+
+class ComplianceSearchResult(BaseModel):
+    regulation_text: str
+    source_document: str
+    title: str
+    jurisdiction: str
+    regulation_type: str
+    relevance_score: float
+
+class DocumentUploadResponse(BaseModel):
+    status: str
+    message: str
+    chunks_created: int
+    document_info: dict
+
+class EnhancedTransactionResult(BaseModel):
+    sender_account: str
+    receiver_account: str
+    amount: float
+    risk_score: float
+    is_suspicious: bool
+    risk_level: str
+    compliance_status: str
+    compliance_risk_level: str
+    required_actions: List[str]
+    applicable_regulations: List[str]
+    compliance_explanation: str
+    confidence_score: Optional[float] = None
+
+class EnhancedBatchResult(BaseModel):
+    total_transactions: int
+    suspicious_count: int
+    high_risk_count: int
+    medium_risk_count: int
+    low_risk_count: int
+    compliance_compliant_count: int
+    compliance_needs_review_count: int
+    compliance_violation_count: int
+    compliance_rate: float
+    predictions: List[EnhancedTransactionResult]
+    compliance_summary: dict
+    processing_metadata: dict
+
+class SystemHealth(BaseModel):
+    status: str
+    components: dict
+    database_stats: dict
+
+# Create router
 compliance_router = APIRouter(prefix="/compliance", tags=["compliance"])
 
-@compliance_router.get("/health")
-async def compliance_health():
-    """
-    Simple health check for compliance system
-    """
-    stats = vector_store.get_stats()
-    return {
-        "status": "healthy",
-        "vector_store": stats,
-        "message": "Compliance system is running"
-    }
+def validate_csv_data(df):
+    """Basic CSV validation"""
+    required_columns = ['Time', 'Date', 'Sender_account', 'Receiver_account', 'Amount', 
+                       'Payment_currency', 'Received_currency', 'Sender_bank_location', 
+                       'Receiver_bank_location', 'Payment_type']
+    
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {', '.join(missing_cols)}")
+    
+    # Basic data validation
+    if df['Amount'].isna().any() or (df['Amount'] <= 0).any():
+        raise ValueError("Invalid amounts detected")
+    
+    return True
 
-@compliance_router.post("/upload-regulation")
-async def upload_regulation(
+@compliance_router.get("/health", response_model=SystemHealth)
+async def compliance_health_check():
+    """Health check for compliance system components"""
+    try:
+        # Import ML components from main
+        from main import get_ml_components
+        ml_components = get_ml_components()
+        
+        vector_stats = vector_store.get_stats()
+        processor_stats = document_processor.get_processing_stats()
+        
+        components = {
+            "ml_model": "loaded" if ml_components and ml_components.get('loaded') else "error",
+            "vector_database": vector_stats.get("status", "unknown"),
+            "document_processor": processor_stats.get("status", "unknown"),
+            "compliance_engine": "active"
+        }
+        
+        overall_status = "healthy" if all(c in ["loaded", "active", "healthy"] for c in components.values()) else "degraded"
+        
+        return SystemHealth(
+            status=overall_status,
+            components=components,
+            database_stats=vector_stats
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Health check failed: {str(e)}")
+        return SystemHealth(
+            status="error",
+            components={"error": str(e)},
+            database_stats={}
+        )
+
+@compliance_router.post("/upload-regulation", response_model=DocumentUploadResponse)
+async def upload_regulation_document(
     file: UploadFile = File(...),
     title: str = Form(...),
     jurisdiction: str = Form("Global"),
     regulation_type: str = Form("AML")
 ):
-    """
-    Upload a regulatory document (PDF)
-    This processes the document and makes it searchable
-    """
+    """Upload regulatory document with RAG processing"""
     try:
-        # Check if file is PDF
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported")
+        logger.info(f"📄 Processing document upload: {file.filename}")
         
-        print(f"📄 Processing document: {file.filename}")
+        # Validate file type
+        if not file.filename.lower().endswith(('.pdf', '.txt', '.md')):
+            raise HTTPException(
+                status_code=400, 
+                detail="Only PDF, TXT, and MD files are supported"
+            )
         
-        # Read file content
+        # Read and process file
         file_content = await file.read()
         
-        # Create metadata for this document
         metadata = {
             "title": title,
             "jurisdiction": jurisdiction,
             "regulation_type": regulation_type
         }
         
-        # Process the document (extract text, split into chunks)
+        # Process document
         processed_chunks = document_processor.process_document(
             file_content=file_content,
             filename=file.filename,
-            metadata=metadata
+            metadata=metadata,
+            splitting_strategy="recursive"
         )
         
-        # Add to vector database for searching
+        if not processed_chunks:
+            raise HTTPException(
+                status_code=400,
+                detail="No content could be extracted from the document"
+            )
+        
+        # Add to vector database
         success = vector_store.add_documents(processed_chunks)
         
-        if success:
-            return {
-                "status": "success",
-                "message": f"Successfully processed {file.filename}",
-                "chunks_created": len(processed_chunks),
-                "document_info": metadata
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to add documents to vector database"
+            )
+        
+        logger.info(f"✅ Successfully processed {file.filename} - {len(processed_chunks)} chunks")
+        
+        return DocumentUploadResponse(
+            status="success",
+            message=f"Successfully processed {file.filename}",
+            chunks_created=len(processed_chunks),
+            document_info={
+                "title": title,
+                "jurisdiction": jurisdiction,
+                "regulation_type": regulation_type,
+                "file_size": len(file_content)
             }
-        else:
-            raise HTTPException(status_code=500, detail="Failed to store document")
-            
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ Error uploading regulation: {str(e)}")
+        logger.error(f"❌ Error uploading regulation: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing document: {str(e)}")
 
 @compliance_router.post("/search-regulations")
-async def search_regulations(query_data: ComplianceQuery):
-    """
-    Search through regulatory documents
-    Returns relevant regulation chunks
-    """
+async def search_regulations_semantic(query_data: ComplianceQuery):
+    """Semantic search through regulations using vector database"""
     try:
-        print(f"🔍 Searching for: {query_data.question}")
+        logger.info(f"🔍 Searching for: {query_data.question}")
         
-        # Search the vector database
-        results = vector_store.search_regulations(
+        search_results = vector_store.search_regulations(
             query=query_data.question,
-            max_results=5
+            max_results=query_data.max_results
         )
         
-        # Convert to response format
-        search_results = []
-        for result in results:
+        if not search_results:
+            return {
+                "status": "success",
+                "query": query_data.question,
+                "results_found": 0,
+                "results": [],
+                "message": "No relevant regulations found. Upload regulatory documents first."
+            }
+        
+        formatted_results = []
+        for result in search_results:
             search_result = ComplianceSearchResult(
                 regulation_text=result["text"],
                 source_document=result["source_file"],
-                relevance_score=result["relevance_score"]
+                title=result.get("title", "Unknown"),
+                jurisdiction=result.get("jurisdiction", "Unknown"),
+                regulation_type=result.get("regulation_type", "Unknown"),
+                relevance_score=convert_numpy_types(result["relevance_score"])
             )
-            search_results.append(search_result)
+            formatted_results.append(search_result)
+        
+        logger.info(f"✅ Found {len(formatted_results)} relevant regulations")
         
         return {
             "status": "success",
             "query": query_data.question,
-            "results_found": len(search_results),
-            "results": search_results
+            "results_found": len(formatted_results),
+            "results": formatted_results
         }
         
     except Exception as e:
-        print(f"❌ Error searching regulations: {str(e)}")
+        logger.error(f"❌ Error in search: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
-@compliance_router.get("/stats")
-async def get_compliance_stats():
-    """
-    Get statistics about our regulatory database
-    """
-    try:
-        # Get vector store statistics
-        vector_stats = vector_store.get_stats()
-        
-        # Count uploaded documents
-        docs_folder = "data/regulatory_docs"
-        doc_count = 0
-        if os.path.exists(docs_folder):
-            doc_count = len([f for f in os.listdir(docs_folder) if f.endswith('.pdf')])
-        
-        return {
-            "total_documents": doc_count,
-            "total_chunks": vector_stats["total_chunks"],
-            "database_status": vector_stats["status"],
-            "storage_location": docs_folder
-        }
-        
-    except Exception as e:
-        print(f"❌ Error getting stats: {str(e)}")
-        return {
-            "total_documents": 0,
-            "total_chunks": 0,
-            "database_status": "error",
-            "error": str(e)
-        }
-
-# Simple test endpoint
-@compliance_router.get("/test")
-async def test_compliance():
-    """
-    Simple test endpoint to make sure everything is connected
-    """
-    return {
-        "message": "Compliance system is working!",
-        "endpoints": [
-            "/compliance/upload-regulation",
-            "/compliance/search-regulations", 
-            "/compliance/stats",
-            "/compliance/health"
-        ]
-    }
-
-# Add this new endpoint to your existing routes.py
-
-@compliance_router.post("/enhanced-csv-upload")
+@compliance_router.post("/enhanced-csv-upload", response_model=EnhancedBatchResult)
 async def enhanced_csv_upload(file: UploadFile = File(...)):
     """
-    Enhanced CSV upload with both ML screening AND compliance analysis
-    This combines your existing ML model with compliance checking
+    MAIN ENDPOINT: Enhanced CSV upload with full ML + RAG compliance analysis
+    This combines all functionality from basic upload + compliance analysis
     """
     try:
-        # Import here to avoid circular imports
-        import sys
-        import os
-        sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+        # Import shared components from main
+        from main import get_ml_components, get_preprocessor
         
-        from main import MODEL_LOADED, model, scaler, feature_engineer, feature_columns, validate_csv_data
-        from .compliance_engine import compliance_engine
-        from models.compliance_models import EnhancedTransactionResult, EnhancedBatchResult
-        import pandas as pd
-        import numpy as np
-        import io
+        ml_components = get_ml_components()
+        preprocessor = get_preprocessor()
         
-        if not MODEL_LOADED:
-            raise HTTPException(status_code=503, detail="ML model not available")
+        if not ml_components or not ml_components.get('loaded'):
+            raise HTTPException(
+                status_code=503, 
+                detail=f"ML model not available: {ml_components.get('error', 'Unknown error') if ml_components else 'Not loaded'}"
+            )
+        
+        if not preprocessor:
+            raise HTTPException(status_code=503, detail="Preprocessor not available")
         
         if not file.filename.endswith('.csv'):
             raise HTTPException(status_code=400, detail="Only CSV files allowed")
         
-        print(f"🚀 Processing enhanced CSV: {file.filename}")
+        logger.info(f"🚀 Processing enhanced CSV: {file.filename}")
         
-        # Step 1: Read and validate CSV (same as existing)
+        # Read CSV with encoding handling
         content = await file.read()
-        csv_text = content.decode('utf-8-sig')
         
+        # Try different encodings
+        for encoding in ['utf-8-sig', 'utf-8', 'latin-1']:
+            try:
+                csv_text = content.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            raise HTTPException(status_code=400, detail="Could not decode CSV file")
+        
+        # Try different separators
         try:
             df = pd.read_csv(io.StringIO(csv_text), sep=',')
             if len(df.columns) == 1:
@@ -201,29 +304,25 @@ async def enhanced_csv_upload(file: UploadFile = File(...)):
         except:
             df = pd.read_csv(io.StringIO(csv_text), sep=';')
         
-        # Validate data
-        validation_result = validate_csv_data(df)
-        if not validation_result.is_valid:
-            error_details = []
-            for error in validation_result.errors[:5]:
-                error_details.append(f"Row {error.row}: {error.error} in {error.column}")
-            raise HTTPException(status_code=400, detail=f"CSV validation failed. Errors: {'; '.join(error_details)}")
+        # Validate CSV
+        validate_csv_data(df)
         
-        print(f"✅ CSV validated. Processing {len(df)} transactions with ML + Compliance...")
+        logger.info(f"✅ CSV validated. Processing {len(df)} transactions...")
         
-        # Step 2: ML Analysis (same as existing)
-        df_features = feature_engineer.create_features(df)
-        X = df_features[feature_columns].fillna(0)
-        X_scaled = scaler.transform(X)
+        # ML Analysis using shared preprocessor
+        df_features = preprocessor.create_features(df.copy())
+        X = df_features[ml_components['feature_columns']].fillna(0)
+        X_scaled = ml_components['scaler'].transform(X)
         
-        ml_predictions = model.predict(X_scaled)
-        ml_probabilities = model.predict_proba(X_scaled)[:, 1]
+        # Get ML predictions
+        ml_probabilities = ml_components['model'].predict_proba(X_scaled)[:, 1]
+        ml_predictions = (ml_probabilities >= ml_components['threshold']).astype(int)
         
-        # Step 3: Prepare ML results for compliance analysis
+        # Prepare ML results for compliance analysis - WITH NUMPY CONVERSION
         ml_results_list = []
         for i in range(len(df)):
-            prob = float(ml_probabilities[i])
-            is_suspicious = bool(ml_predictions[i])
+            prob = convert_numpy_types(ml_probabilities[i])
+            is_suspicious = convert_numpy_types(ml_predictions[i])
             
             if prob >= 0.7:
                 risk_level = "High"
@@ -232,88 +331,119 @@ async def enhanced_csv_upload(file: UploadFile = File(...)):
             else:
                 risk_level = "Low"
             
-            ml_result = {
+            ml_results_list.append({
                 'risk_score': prob,
-                'is_suspicious': is_suspicious,
+                'is_suspicious': bool(is_suspicious),
                 'risk_level': risk_level
-            }
-            ml_results_list.append(ml_result)
+            })
         
-        # Step 4: Compliance Analysis (NEW!)
+        # COMPLIANCE ANALYSIS using RAG
+        logger.info("🏛️ Running compliance analysis with RAG...")
         compliance_results = compliance_engine.check_batch_compliance(df, ml_results_list)
         
-        # Step 5: Combine ML + Compliance Results
+        # Combine ML + Compliance Results - WITH NUMPY CONVERSION
         enhanced_results = []
-        compliance_counts = {"compliant": 0, "needs_review": 0, "violation": 0}
+        compliance_counts = {"compliant": 0, "needs_review": 0, "violation": 0, "error": 0}
+        risk_counts = {"High": 0, "Medium": 0, "Low": 0}
         
         for i, (_, row) in enumerate(df.iterrows()):
             ml_result = ml_results_list[i]
             compliance_result = compliance_results[i]
             
-            # Count compliance statuses
+            # Count results
             comp_status = compliance_result.get('compliance_status', 'needs_review')
             compliance_counts[comp_status] = compliance_counts.get(comp_status, 0) + 1
+            risk_counts[ml_result['risk_level']] += 1
             
-            # Create enhanced result
+            # Create enhanced result - ALL VALUES CONVERTED
             enhanced_result = EnhancedTransactionResult(
-                # Basic transaction info
                 sender_account=str(row['Sender_account']),
                 receiver_account=str(row['Receiver_account']),
-                amount=float(row['Amount']),
-                
-                # ML results
-                risk_score=ml_result['risk_score'],
-                is_suspicious=ml_result['is_suspicious'],
+                amount=convert_numpy_types(row['Amount']),
+                risk_score=convert_numpy_types(ml_result['risk_score']),
+                is_suspicious=convert_numpy_types(ml_result['is_suspicious']),
                 risk_level=ml_result['risk_level'],
-                
-                # Compliance results
                 compliance_status=compliance_result.get('compliance_status', 'needs_review'),
                 compliance_risk_level=compliance_result.get('risk_level', 'medium'),
                 required_actions=compliance_result.get('required_actions', []),
                 applicable_regulations=compliance_result.get('applicable_regulations', []),
-                compliance_explanation=compliance_result.get('explanation', 'Analysis unavailable')
+                compliance_explanation=compliance_result.get('explanation', 'Analysis completed'),
+                confidence_score=convert_numpy_types(compliance_result.get('confidence_score')) if compliance_result.get('confidence_score') is not None else None
             )
             enhanced_results.append(enhanced_result)
         
-        # Step 6: Generate compliance summary
+        # Generate summary
         compliance_summary = compliance_engine.get_compliance_summary(compliance_results)
         
-        # Step 7: Calculate compliance rate
+        # Calculate rates - WITH NUMPY CONVERSION
         total_transactions = len(df)
-        compliance_rate = (compliance_counts.get('compliant', 0) / total_transactions * 100) if total_transactions > 0 else 0
+        compliance_rate = convert_numpy_types((compliance_counts.get('compliant', 0) / total_transactions * 100) if total_transactions > 0 else 0)
         
-        # Step 8: Create enhanced response
-        ml_risk_counts = {"High": 0, "Medium": 0, "Low": 0}
-        for result in ml_results_list:
-            ml_risk_counts[result['risk_level']] += 1
+        # Processing metadata
+        processing_metadata = {
+            "ml_threshold": convert_numpy_types(ml_components['threshold']),
+            "features_used": len(ml_components['feature_columns']),
+            "compliance_engine": "rag_enabled",
+            "regulations_in_db": vector_store.get_stats().get("total_chunks", 0),
+            "processing_timestamp": pd.Timestamp.now().isoformat()
+        }
         
-        enhanced_response = EnhancedBatchResult(
-            # ML stats (existing)
+        # Create response - ALL VALUES CONVERTED
+        response = EnhancedBatchResult(
             total_transactions=total_transactions,
-            suspicious_count=int(ml_predictions.sum()),
-            high_risk_count=ml_risk_counts["High"],
-            medium_risk_count=ml_risk_counts["Medium"],
-            low_risk_count=ml_risk_counts["Low"],
-            
-            # Compliance stats (new)
+            suspicious_count=convert_numpy_types(int(ml_predictions.sum())),
+            high_risk_count=risk_counts["High"],
+            medium_risk_count=risk_counts["Medium"],
+            low_risk_count=risk_counts["Low"],
             compliance_compliant_count=compliance_counts.get('compliant', 0),
             compliance_needs_review_count=compliance_counts.get('needs_review', 0),
             compliance_violation_count=compliance_counts.get('violation', 0),
             compliance_rate=compliance_rate,
-            
-            # Combined results
             predictions=enhanced_results,
-            compliance_summary=compliance_summary
+            compliance_summary=convert_numpy_types(compliance_summary),
+            processing_metadata=convert_numpy_types(processing_metadata)
         )
         
-        print(f"🎉 Enhanced analysis complete!")
-        print(f"   ML: {int(ml_predictions.sum())} suspicious transactions")
-        print(f"   Compliance: {compliance_counts['needs_review']} need review, {compliance_counts['violation']} violations")
+        logger.info(f"🎉 Enhanced analysis complete!")
+        logger.info(f"   ML: {int(ml_predictions.sum())} suspicious | Compliance: {compliance_counts}")
         
-        return enhanced_response
+        return response
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Enhanced processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Enhanced processing failed: {str(e)}")
+        logger.error(f"❌ Enhanced processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+@compliance_router.get("/stats")
+async def get_compliance_stats():
+    """Get comprehensive compliance system statistics"""
+    try:
+        from main import get_ml_components
+        
+        vector_stats = vector_store.get_stats()
+        processor_stats = document_processor.get_processing_stats()
+        ml_components = get_ml_components()
+        
+        return {
+            "system_status": "active",
+            "vector_database": convert_numpy_types(vector_stats),
+            "document_processor": convert_numpy_types(processor_stats),
+            "ml_model": {
+                "loaded": ml_components.get('loaded', False) if ml_components else False,
+                "threshold": convert_numpy_types(ml_components.get('threshold', 'N/A')) if ml_components else 'N/A',
+                "features": len(ml_components.get('feature_columns', [])) if ml_components and ml_components.get('loaded') else 0
+            },
+            "main_endpoint": "/compliance/enhanced-csv-upload",
+            "capabilities": [
+                "PDF document processing",
+                "Local vector embeddings search",
+                "ML risk assessment (XGBoost + 33 features)", 
+                "RAG compliance analysis",
+                "Intelligent mock compliance responses"
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error getting stats: {str(e)}")
+        return {"status": "error", "error": str(e)}

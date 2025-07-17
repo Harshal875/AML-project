@@ -38,8 +38,7 @@ class ComplianceEngine:
                 transaction_data=transaction_row,
                 characteristics=analysis['characteristics'],
                 search_queries=analysis['search_queries'],
-                vector_store=vector_store,
-                use_mock=True  # For now, always use mock until we have regulations
+                vector_store=vector_store
             )
             
             # Step 4: Add transaction analysis metadata
