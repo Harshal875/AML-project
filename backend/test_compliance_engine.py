@@ -18,6 +18,7 @@ def test_compliance_engine():
             'Receiver_bank_location': 'USA',
             'Payment_currency': 'USD',
             'Received_currency': 'USD',
+            
             'Time': '14:30:00'
         },
         {
